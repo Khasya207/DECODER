@@ -351,20 +351,24 @@ bool IqDecoder::scan() {
     while (buffer_.size() - cursor >= static_cast<std::size_t>(FRAME_WINDOW_SAMPLES)) {
         Candidate best;
         std::size_t best_offset = cursor;
+        bool found = false;
         for (std::size_t offset = cursor;
-             offset + FRAME_WINDOW_SAMPLES <= buffer_.size(); ++offset) {
+             offset + FRAME_WINDOW_SAMPLES <= buffer_.size() && !found; ++offset) {
+            Candidate at_offset;
             for (const auto [preamble, protocol] : {
                      std::pair<std::uint16_t, IqProtocol>{OPN_PREAMBLE, IqProtocol::OPN},
                      std::pair<std::uint16_t, IqProtocol>{AMB_PREAMBLE, IqProtocol::AMB}}) {
                 const auto candidate = match_preamble(buffer_, offset, preamble, protocol);
-                if (candidate.score > best.score) {
-                    best = candidate;
-                    best_offset = offset;
-                }
+                if (candidate.score > at_offset.score) at_offset = candidate;
+            }
+            if (at_offset.score >= MIN_PREAMBLE_SCORE) {
+                best = at_offset;
+                best_offset = offset;
+                found = true;
             }
         }
 
-        if (best.score < MIN_PREAMBLE_SCORE) {
+        if (!found) {
             cursor = buffer_.size() - static_cast<std::size_t>(FRAME_WINDOW_SAMPLES) + 1;
             break;
         }
