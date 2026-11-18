@@ -18,6 +18,8 @@ constexpr int PAYLOAD_SYMBOLS = 80;
 constexpr int FRAME_SAMPLES = (PREAMBLE_SYMBOLS + PAYLOAD_SYMBOLS) * SAMPLES_PER_SYMBOL;
 constexpr int FRAME_WINDOW_SAMPLES = FRAME_SAMPLES + SAMPLES_PER_SYMBOL - 1;
 constexpr std::uint64_t QUIET_WINDOW_SAMPLES = 625'000; // 250 ms at 2.5 MS/s
+constexpr float MIN_PREAMBLE_SCORE = 0.72f;
+constexpr float MIN_SIGNAL_DB = -40.0f;
 constexpr std::uint16_t OPN_PREAMBLE = 0xf9a8;
 constexpr std::uint16_t AMB_PREAMBLE = 0x51e4;
 
@@ -138,7 +140,7 @@ void IqDecoder::scan() {
         // Noise has no stable phase relationship with the Barker preamble.
         // This threshold is deliberately conservative; sensitivity tuning is
         // measured with captures, not hidden in the race engine.
-        if (best.score < 0.58f) {
+        if (best.score < MIN_PREAMBLE_SCORE) {
             cursor = buffer_.size() - static_cast<std::size_t>(FRAME_WINDOW_SAMPLES) + 1;
             break;
         }
@@ -147,7 +149,6 @@ void IqDecoder::scan() {
         const std::complex<float> correction = std::polar(1.0f, -phase);
         std::array<std::uint8_t, 80> softbits{};
         float signal = 0.0f;
-        std::uint32_t hits = 0;
         for (int symbol = 0; symbol < PAYLOAD_SYMBOLS; ++symbol) {
             const std::size_t sample_offset = best_offset
                 + static_cast<std::size_t>((PREAMBLE_SYMBOLS + symbol) * SAMPLES_PER_SYMBOL + best.phase);
@@ -161,7 +162,6 @@ void IqDecoder::scan() {
             const float normalized = std::clamp(value.real() / 1.0f, -1.0f, 1.0f);
             softbits[symbol] = static_cast<std::uint8_t>(std::clamp(
                 static_cast<int>(127.5f + normalized * 127.5f), 0, 255));
-            if (std::abs(value) > 0.15f) ++hits;
         }
 
         std::optional<std::uint32_t> id;
@@ -172,18 +172,20 @@ void IqDecoder::scan() {
             // values are retained for the caller to classify later.
             id = frame->id;
         }
-        if (id) {
+        const float average_signal = signal / static_cast<float>(PAYLOAD_SYMBOLS);
+        const float signal_db = 20.0f * std::log10(std::max(average_signal, 1e-6f));
+        const bool usable_id = id && (best.protocol == IqProtocol::OPN || *id != 0);
+        if (usable_id && signal_db >= MIN_SIGNAL_DB) {
             const std::uint64_t sample_index = absolute_samples_ + best_offset
                 + static_cast<std::uint64_t>(PREAMBLE_SYMBOLS * SAMPLES_PER_SYMBOL);
-            const float average_signal = signal / static_cast<float>(PAYLOAD_SYMBOLS);
             add_hit({
                 sample_index,
                 static_cast<std::uint64_t>(std::llround(
                     static_cast<double>(sample_index) * 1'000'000.0 / sample_rate_)),
                 best.protocol,
                 *id,
-                20.0f * std::log10(std::max(average_signal, 1e-6f)),
-                hits,
+                signal_db,
+                1,
                 0,
             });
             cursor = best_offset + static_cast<std::size_t>(FRAME_SAMPLES);
