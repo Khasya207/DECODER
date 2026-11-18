@@ -102,4 +102,23 @@ int main() {
     assert(!status_samples.empty());
     assert(status_samples.front().frames_received == 2);
     assert(status_samples.front().frames_processed == 2);
+
+    // A delayed USB callback must anchor the next buffer to its own arrival
+    // time. The passing is entirely in the second buffer, after a 200 ms gap.
+    yurlaps::decoder::IqDecoder timed_decoder;
+    std::vector<yurlaps::decoder::IqPassing> timed_passings;
+    timed_decoder.set_callback([&timed_passings](const yurlaps::decoder::IqPassing& passing) {
+        timed_passings.push_back(passing);
+    });
+    std::vector<yurlaps::decoder::IqSample> prefix(500, {0.0f, 0.0f});
+    std::vector<yurlaps::decoder::IqSample> delayed_input = prefix;
+    delayed_input.insert(delayed_input.end(), samples.begin(), samples.end());
+    timed_decoder.feed(prefix, 100'000);
+    timed_decoder.feed(std::vector<yurlaps::decoder::IqSample>(
+        delayed_input.begin() + static_cast<std::ptrdiff_t>(prefix.size()), delayed_input.end()),
+        300'000);
+    timed_decoder.flush();
+    assert(timed_passings.size() == 1);
+    assert(timed_passings.front().timestamp_us >= 300'000);
+    assert(timed_passings.front().timestamp_us < 301'000);
 }

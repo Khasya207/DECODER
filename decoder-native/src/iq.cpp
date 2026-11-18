@@ -12,6 +12,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -25,6 +26,8 @@ constexpr int FRAME_SAMPLES = (PREAMBLE_SYMBOLS + PAYLOAD_SYMBOLS) * SAMPLES_PER
 constexpr int FRAME_WINDOW_SAMPLES = FRAME_SAMPLES + SAMPLES_PER_SYMBOL - 1;
 constexpr std::uint64_t QUIET_WINDOW_US = 250'000;
 constexpr float MIN_PREAMBLE_SCORE = 0.72f;
+constexpr float QUICK_PREAMBLE_SCORE = 0.12f;
+constexpr int QUICK_PREAMBLE_SYMBOLS = 8;
 constexpr float MIN_SIGNAL_DB = -40.0f;
 constexpr float MIN_SNR_DB = 4.0f;
 constexpr std::size_t NOISE_WINDOW_SIZE = 4096;
@@ -76,6 +79,35 @@ Candidate match_preamble(const std::vector<IqSample>& samples,
         }
     }
     return best;
+}
+
+// Full preamble scoring is deliberately expensive because it also estimates
+// carrier phase drift.  Rejecting almost all noise with a short gate keeps the
+// hot scan loop practical on a Raspberry Pi without changing the acceptance
+// threshold used for real frames.
+bool quick_preamble_gate(const std::vector<IqSample>& samples,
+                         std::size_t offset,
+                         std::uint16_t preamble) {
+    for (int phase = 0; phase < SAMPLES_PER_SYMBOL; ++phase) {
+        float correlation_i = 0.0f;
+        float correlation_q = 0.0f;
+        float energy = 0.0f;
+        for (int symbol = 0; symbol < QUICK_PREAMBLE_SYMBOLS; ++symbol) {
+            const auto& sample = samples[offset + static_cast<std::size_t>(
+                symbol * SAMPLES_PER_SYMBOL + phase)];
+            const float expected = (preamble & (1u << (PREAMBLE_SYMBOLS - 1 - symbol)))
+                ? 1.0f : -1.0f;
+            correlation_i += sample.i * expected;
+            correlation_q += sample.q * expected;
+            energy += sample.i * sample.i + sample.q * sample.q;
+        }
+        const float score = energy > 1e-6f
+            ? (correlation_i * correlation_i + correlation_q * correlation_q)
+                / (energy * static_cast<float>(QUICK_PREAMBLE_SYMBOLS))
+            : 0.0f;
+        if (score >= QUICK_PREAMBLE_SCORE) return true;
+    }
+    return false;
 }
 
 FrameMetrics decode_metrics(const std::vector<IqSample>& samples,
@@ -189,22 +221,29 @@ void IqDecoder::feed_samples(const std::vector<IqSample>& samples,
 
     const std::uint64_t buffer_start_sample = current_sample_index();
     if (host_timestamp_us) {
-        if (!has_host_timebase_) {
-            host_timebase_anchor_us_ = *host_timestamp_us - static_cast<std::uint64_t>(
-                std::llround(static_cast<double>(buffer_start_sample) * 1'000'000.0 / sample_rate_));
-            has_host_timebase_ = true;
-        }
         if (has_last_host_timestamp_) {
-            const double expected_us = static_cast<double>(samples.size()) * 1'000'000.0 / sample_rate_;
-            const double actual_us = static_cast<double>(*host_timestamp_us - last_host_timestamp_us_);
-            const auto error_us = static_cast<std::uint64_t>(std::llround(std::fabs(actual_us - expected_us)));
+            const double expected_us = static_cast<double>(last_host_buffer_samples_)
+                * 1'000'000.0 / sample_rate_;
+            const double actual_us = static_cast<double>(*host_timestamp_us)
+                - static_cast<double>(last_host_timestamp_us_);
+            const auto error_us = static_cast<std::uint64_t>(std::llround(
+                std::fabs(actual_us - expected_us)));
             jitter_history_.push_back({*host_timestamp_us, error_us});
             while (!jitter_history_.empty() && *host_timestamp_us - jitter_history_.front().first > 5'000'000) {
                 jitter_history_.pop_front();
             }
         }
+        host_segments_.push_back({buffer_start_sample, *host_timestamp_us});
+        // Pending passings are closed after 250 ms, so retaining a few
+        // seconds is enough for every timestamp that can still be emitted.
+        const auto keep_samples = static_cast<std::uint64_t>(std::llround(sample_rate_ * 10.0));
+        while (host_segments_.size() > 1
+            && buffer_start_sample - host_segments_.front().sample_start > keep_samples) {
+            host_segments_.pop_front();
+        }
         last_host_timestamp_us_ = *host_timestamp_us;
         has_last_host_timestamp_ = true;
+        last_host_buffer_samples_ = samples.size();
     }
 
     buffer_.insert(buffer_.end(), samples.begin(), samples.end());
@@ -268,9 +307,23 @@ void IqDecoder::flush() {
 }
 
 std::uint64_t IqDecoder::timestamp_for_sample(std::uint64_t sample_index) const {
-    const auto offset = static_cast<std::uint64_t>(std::llround(
+    if (!host_segments_.empty()) {
+        const auto found = std::upper_bound(
+            host_segments_.begin(), host_segments_.end(), sample_index,
+            [](std::uint64_t sample, const HostSegment& segment) {
+                return sample < segment.sample_start;
+            });
+        const auto& segment = found == host_segments_.begin()
+            ? host_segments_.front() : *std::prev(found);
+        const auto offset = static_cast<std::int64_t>(sample_index)
+            - static_cast<std::int64_t>(segment.sample_start);
+        const auto offset_us = static_cast<std::int64_t>(std::llround(
+            static_cast<double>(offset) * 1'000'000.0 / sample_rate_));
+        const auto timestamp = static_cast<std::int64_t>(segment.host_start_us) + offset_us;
+        return timestamp > 0 ? static_cast<std::uint64_t>(timestamp) : 0;
+    }
+    return static_cast<std::uint64_t>(std::llround(
         static_cast<double>(sample_index) * 1'000'000.0 / sample_rate_));
-    return has_host_timebase_ ? host_timebase_anchor_us_ + offset : offset;
 }
 
 std::uint64_t IqDecoder::current_sample_index() const noexcept {
@@ -374,11 +427,13 @@ bool IqDecoder::scan() {
         std::size_t best_offset = cursor;
         bool found = false;
         for (std::size_t offset = cursor;
-             offset + FRAME_WINDOW_SAMPLES <= buffer_.size() && !found; ++offset) {
+             offset + FRAME_WINDOW_SAMPLES <= buffer_.size() && !found;
+             ++offset) {
             Candidate at_offset;
             for (const auto [preamble, protocol] : {
                      std::pair<std::uint16_t, IqProtocol>{OPN_PREAMBLE, IqProtocol::OPN},
                      std::pair<std::uint16_t, IqProtocol>{AMB_PREAMBLE, IqProtocol::AMB}}) {
+                if (!quick_preamble_gate(buffer_, offset, preamble)) continue;
                 const auto candidate = match_preamble(buffer_, offset, preamble, protocol);
                 if (candidate.score > at_offset.score) at_offset = candidate;
             }

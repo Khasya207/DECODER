@@ -22,7 +22,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 Untuk build Windows dengan RTL-SDR dan ZeroMQ, jalankan workflow
-`.github/workflows/build-yurlaps-decoder.yml` dari root repository. Artifact menghasilkan `YurLapsDecoder.exe`
+`.github/workflows/build.yml` dari root repository. Artifact menghasilkan `YurLapsDecoder.exe`
 beserta DLL yang dibutuhkan.
 
 Mode capture IQ:
@@ -53,3 +53,9 @@ window 250 ms. Timestamp berasal dari sample awal preamble. `duration_us`
 hanya diisi jika bentuk waveform memberikan crossing yang cukup jelas; jika
 tidak, nilainya `0`. Pesan RC4, RC4 Hybrid, Vostok, dan learning tetap tidak
 masuk ke output race.
+
+Pada backend RTL-SDR, callback USB dikonversi menjadi timestamp sample awal
+buffer. Setiap buffer memiliki anchor host sendiri, sehingga jeda callback
+tidak membuat timestamp berikutnya kembali ke nol atau bergeser mengikuti
+kecepatan pemrosesan CPU. Blog V4 memakai tuner internalnya; dongle non-V4
+diatur ke direct sampling untuk carrier OPN 5 MHz.

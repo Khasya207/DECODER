@@ -98,10 +98,16 @@ private:
     StatusCallback status_callback_;
     TimeSyncCallback time_sync_callback_;
 
-    bool has_host_timebase_ = false;
-    std::uint64_t host_timebase_anchor_us_ = 0;
+    struct HostSegment {
+        std::uint64_t sample_start{};
+        std::uint64_t host_start_us{};
+    };
+    // Each RTL callback gets its own anchor.  This keeps timestamps tied to
+    // the actual arrival of a buffer when USB delivery has a gap.
+    std::deque<HostSegment> host_segments_;
     std::uint64_t last_host_timestamp_us_ = 0;
     bool has_last_host_timestamp_ = false;
+    std::uint64_t last_host_buffer_samples_ = 0;
     std::deque<std::pair<std::uint64_t, std::uint64_t>> jitter_history_;
     std::uint64_t next_status_sample_{};
     std::uint64_t frames_received_ = 0;
