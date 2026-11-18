@@ -1,0 +1,74 @@
+#include "yurlaps_decoder/protocol.hpp"
+#include "yurlaps_decoder/iq.hpp"
+#include "yurlaps_decoder/rtl.hpp"
+#include "yurlaps_decoder/zmq.hpp"
+
+#include <iostream>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace {
+
+int run_iq(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        std::cerr << "cannot open IQ capture: " << path << '\n';
+        return 2;
+    }
+    yurlaps::decoder::IqDecoder decoder;
+    decoder.set_callback([](const yurlaps::decoder::IqPassing& passing) {
+        std::cout << "P " << passing.timestamp_us / 1000 << ' '
+                  << (passing.protocol == yurlaps::decoder::IqProtocol::OPN ? "OPN" : "AMB")
+                  << ' ' << passing.id
+                  << ' ' << std::fixed << std::setprecision(2) << passing.rssi_db
+                  << ' ' << passing.hits << ' ' << passing.duration_us << '\n'
+                  << std::flush;
+    });
+    std::vector<std::uint8_t> chunk(64 * 1024);
+    while (input) {
+        input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+        const auto count = input.gcount();
+        if (count > 0) decoder.feed(chunk.data(), static_cast<std::size_t>(count));
+    }
+    decoder.flush();
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--iq") return run_iq(argv[2]);
+    if (argc >= 2 && std::string(argv[1]) == "--rtl") {
+        yurlaps::decoder::RtlOptions options;
+        if (argc >= 3) options.serial = argv[2];
+        if (argc >= 4) options.gain_db = std::stoi(argv[3]);
+        yurlaps::decoder::IqDecoder decoder;
+        yurlaps::decoder::Publisher publisher;
+        std::string publisher_error;
+        publisher.bind("tcp://127.0.0.1:5556", publisher_error);
+        decoder.set_callback([&publisher](const yurlaps::decoder::IqPassing& passing) {
+            std::ostringstream line;
+            line << "P " << passing.timestamp_us / 1000 << ' '
+                      << (passing.protocol == yurlaps::decoder::IqProtocol::OPN ? "OPN" : "AMB")
+                      << ' ' << passing.id << ' ' << std::fixed << std::setprecision(2)
+                      << passing.rssi_db << ' ' << passing.hits << ' ' << passing.duration_us
+                      ;
+            std::cout << line.str() << '\n' << std::flush;
+            publisher.send(line.str());
+        });
+        std::string error;
+        const int result = yurlaps::decoder::run_rtl_sdr(options, decoder, error);
+        decoder.flush();
+        if (result != 0) std::cerr << error << '\n';
+        return result;
+    }
+    for (std::string line; std::getline(std::cin, line);) {
+        if (const auto event = yurlaps::decoder::parse_line(line)) {
+            std::cout << yurlaps::decoder::format_event(*event) << '\n' << std::flush;
+        }
+    }
+    return 0;
+}
