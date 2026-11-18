@@ -22,7 +22,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 Untuk build Windows dengan RTL-SDR dan ZeroMQ, jalankan workflow
-`.github/workflows/build.yml`. Artifact menghasilkan `YurLapsDecoder.exe`
+`.github/workflows/build-yurlaps-decoder.yml` dari root repository. Artifact menghasilkan `YurLapsDecoder.exe`
 beserta DLL yang dibutuhkan.
 
 Mode capture IQ:
@@ -39,3 +39,17 @@ YurLapsDecoder.exe --rtl YD0001 28
 
 Output passing dikirim ke stdout dan, bila dibangun dengan ZeroMQ, ke
 `tcp://127.0.0.1:5556`.
+
+Format pesan kompatibel dengan output OpenStint:
+
+```text
+P <timestamp_ms> <OPN|AMB> <id> <rssi_dbfs> <hits> <duration_us> <mer_db>
+S <timestamp_ms> <noise_dbfs> <dc_offset> <frames_received> <frames_processed> <jitter_p95_ms>
+T <timestamp_ms> OPN <id> <transponder_timecode>
+```
+
+Passing baru dikirim setelah minimal dua frame untuk ID yang sama dan quiet
+window 250 ms. Timestamp berasal dari sample awal preamble. `duration_us`
+hanya diisi jika bentuk waveform memberikan crossing yang cukup jelas; jika
+tidak, nilainya `0`. Pesan RC4, RC4 Hybrid, Vostok, dan learning tetap tidak
+masuk ke output race.
