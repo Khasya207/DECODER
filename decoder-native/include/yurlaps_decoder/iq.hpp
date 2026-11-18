@@ -51,6 +51,8 @@ private:
         IqPassing passing;
         std::uint64_t first_sample{};
         std::uint64_t last_sample{};
+        double weighted_sample_sum{};
+        double weight_sum{};
     };
     std::unordered_map<std::uint64_t, Pending> pending_;
 

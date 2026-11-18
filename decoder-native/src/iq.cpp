@@ -93,7 +93,9 @@ void IqDecoder::flush() {
 
 void IqDecoder::emit(Pending& pending) {
     if (!callback_) return;
-    pending.passing.sample_index = (pending.first_sample + pending.last_sample) / 2;
+    pending.passing.sample_index = pending.weight_sum > 0.0
+        ? static_cast<std::uint64_t>(std::llround(pending.weighted_sample_sum / pending.weight_sum))
+        : (pending.first_sample + pending.last_sample) / 2;
     pending.passing.timestamp_us = static_cast<std::uint64_t>(std::llround(
         static_cast<double>(pending.passing.sample_index) * 1'000'000.0 / sample_rate_));
     pending.passing.duration_us = static_cast<std::uint64_t>(std::llround(
@@ -122,11 +124,16 @@ void IqDecoder::add_hit(const IqPassing& hit) {
     flush_expired(hit.sample_index);
     auto found = pending_.find(key);
     if (found == pending_.end()) {
-        pending_.emplace(key, Pending{hit, hit.sample_index, hit.sample_index});
+        const double weight = std::max(0.001, std::pow(10.0, static_cast<double>(hit.rssi_db) / 20.0));
+        pending_.emplace(key, Pending{hit, hit.sample_index, hit.sample_index,
+                                      static_cast<double>(hit.sample_index) * weight, weight});
         return;
     }
     auto& pending = found->second;
     pending.last_sample = hit.sample_index;
+    const double weight = std::max(0.001, std::pow(10.0, static_cast<double>(hit.rssi_db) / 20.0));
+    pending.weighted_sample_sum += static_cast<double>(hit.sample_index) * weight;
+    pending.weight_sum += weight;
     pending.passing.hits += hit.hits;
     pending.passing.rssi_db = std::max(pending.passing.rssi_db, hit.rssi_db);
 }
