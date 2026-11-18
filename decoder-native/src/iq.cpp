@@ -36,6 +36,8 @@ struct Candidate {
     float score = 0.0f;
     int phase = 0;
     std::complex<float> correlation{};
+    float phase_at_preamble_center = 0.0f;
+    float phase_per_symbol = 0.0f;
     IqProtocol protocol = IqProtocol::OPN;
 };
 
@@ -51,18 +53,27 @@ Candidate match_preamble(const std::vector<IqSample>& samples,
     Candidate best;
     for (int phase = 0; phase < SAMPLES_PER_SYMBOL; ++phase) {
         std::complex<float> correlation{};
+        std::complex<float> phase_correlation{};
         float energy = 0.0f;
+        std::complex<float> previous{};
         for (int symbol = 0; symbol < PREAMBLE_SYMBOLS; ++symbol) {
             const auto& sample = samples[offset + static_cast<std::size_t>(symbol * SAMPLES_PER_SYMBOL + phase)];
             const std::complex<float> value{sample.i, sample.q};
             const float expected = (preamble & (1u << (PREAMBLE_SYMBOLS - 1 - symbol))) ? 1.0f : -1.0f;
-            correlation += value * expected;
+            const auto aligned = value * expected;
+            correlation += aligned;
+            if (symbol > 0) phase_correlation += aligned * std::conj(previous);
+            previous = aligned;
             energy += std::norm(value);
         }
         const float score = energy > 1e-6f
             ? std::norm(correlation) / (energy * static_cast<float>(PREAMBLE_SYMBOLS))
             : 0.0f;
-        if (score > best.score) best = {score, phase, correlation, protocol};
+        const float phase_per_symbol = std::arg(phase_correlation);
+        const float phase_at_center = std::arg(correlation);
+        if (score > best.score) {
+            best = {score, phase, correlation, phase_at_center, phase_per_symbol, protocol};
+        }
     }
     return best;
 }
@@ -70,7 +81,8 @@ Candidate match_preamble(const std::vector<IqSample>& samples,
 FrameMetrics decode_metrics(const std::vector<IqSample>& samples,
                             std::size_t offset,
                             int phase,
-                            const std::complex<float>& correction,
+                            float phase_at_preamble_center,
+                            float phase_per_symbol,
                             std::array<std::uint8_t, PAYLOAD_SYMBOLS>& softbits) {
     float signal = 0.0f;
     std::vector<std::complex<float>> symbols;
@@ -81,6 +93,11 @@ FrameMetrics decode_metrics(const std::vector<IqSample>& samples,
         std::complex<float> value{};
         for (int sample = 0; sample < SAMPLES_PER_SYMBOL; ++sample) {
             const auto& point = samples[sample_offset + static_cast<std::size_t>(sample)];
+            const float symbol_position = static_cast<float>(PREAMBLE_SYMBOLS + symbol)
+                + static_cast<float>(sample) / static_cast<float>(SAMPLES_PER_SYMBOL)
+                - (static_cast<float>(PREAMBLE_SYMBOLS) - 1.0f) / 2.0f;
+            const auto correction = std::polar(1.0f,
+                -(phase_at_preamble_center + phase_per_symbol * symbol_position));
             value += std::complex<float>{point.i, point.q} * correction;
         }
         value /= static_cast<float>(SAMPLES_PER_SYMBOL);
@@ -373,9 +390,9 @@ bool IqDecoder::scan() {
             break;
         }
         frame_seen = true;
-        const std::complex<float> correction = std::polar(1.0f, -std::arg(best.correlation));
         std::array<std::uint8_t, PAYLOAD_SYMBOLS> softbits{};
-        const auto metrics = decode_metrics(buffer_, best_offset, best.phase, correction, softbits);
+        const auto metrics = decode_metrics(buffer_, best_offset, best.phase,
+            best.phase_at_preamble_center, best.phase_per_symbol, softbits);
 
         ++frames_received_;
         const float noise_db = noise_floor_db();
