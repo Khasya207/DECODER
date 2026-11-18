@@ -1,5 +1,6 @@
 #include "yurlaps_decoder/rtl.hpp"
 
+#include <chrono>
 #include <sstream>
 
 #ifdef YURLAPS_WITH_RTLSDR
@@ -10,11 +11,17 @@ namespace {
 
 struct Context {
     IqDecoder* decoder{};
+    std::uint64_t start_us{};
 };
+
+std::uint64_t steady_us() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 void receive(unsigned char* bytes, std::uint32_t length, void* opaque) {
     auto* context = static_cast<Context*>(opaque);
-    context->decoder->feed(bytes, length);
+    context->decoder->feed(bytes, length, steady_us() - context->start_us);
 }
 
 }  // namespace
@@ -44,7 +51,7 @@ int run_rtl_sdr(const RtlOptions& options, IqDecoder& decoder, std::string& erro
         error = "rtlsdr_set_tuner_gain gagal: " + std::to_string(result); close(); return 2;
     }
     rtlsdr_reset_buffer(device);
-    Context context{&decoder};
+    Context context{&decoder, steady_us()};
     result = rtlsdr_read_async(device, receive, &context, 0, 16'384);
     close();
     if (result != 0) { error = "rtlsdr_read_async gagal: " + std::to_string(result); return 2; }

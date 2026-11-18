@@ -49,28 +49,48 @@ int main() {
         samples.push_back({value, 0.0f});
         samples.push_back({value, 0.0f});
     };
-    for (int bit = 0; bit < 16; ++bit) {
-        append_symbol((preamble & (1u << (15 - bit))) ? 0.8f : -0.8f);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        for (int bit = 0; bit < 16; ++bit) {
+            append_symbol((preamble & (1u << (15 - bit))) ? 0.8f : -0.8f);
+        }
+        int state = 0;
+        for (int step = 0; step < 40; ++step) {
+            const int input = bits[step] ? 1 : 0;
+            const auto reg = static_cast<std::uint16_t>(((state << 1) | input) & 0x1ff);
+            append_symbol(parity(reg & poly_a) ? 0.8f : -0.8f);
+            append_symbol(parity(reg & poly_b) ? 0.8f : -0.8f);
+            state = ((state << 1) | input) & 0xff;
+        }
+        samples.push_back({0.0f, 0.0f});
     }
-    int state = 0;
-    for (int step = 0; step < 40; ++step) {
-        const int input = bits[step] ? 1 : 0;
-        const auto reg = static_cast<std::uint16_t>(((state << 1) | input) & 0x1ff);
-        append_symbol(parity(reg & poly_a) ? 0.8f : -0.8f);
-        // Each convolutional pair is represented by two consecutive symbols;
-        // append_symbol above has already emitted two IQ samples per symbol.
-        append_symbol(parity(reg & poly_b) ? 0.8f : -0.8f);
-        state = ((state << 1) | input) & 0xff;
-    }
-    samples.push_back({0.0f, 0.0f});
 
     std::vector<yurlaps::decoder::IqPassing> passings;
+    std::vector<yurlaps::decoder::IqStatus> statuses;
     yurlaps::decoder::IqDecoder decoder;
     decoder.set_callback([&passings](const yurlaps::decoder::IqPassing& passing) {
         passings.push_back(passing);
+    });
+    decoder.set_status_callback([&statuses](const yurlaps::decoder::IqStatus& status) {
+        statuses.push_back(status);
     });
     decoder.feed(samples);
     decoder.flush();
     assert(passings.size() == 1);
     assert(passings.front().id == id);
+    assert(passings.front().hits == 2);
+    assert(passings.front().mer_db > 20.0f);
+    assert(passings.front().duration_us == 0);
+
+    yurlaps::decoder::IqDecoder status_decoder(1'000.0);
+    std::vector<yurlaps::decoder::IqStatus> status_samples;
+    status_decoder.set_status_callback([&status_samples](const yurlaps::decoder::IqStatus& status) {
+        status_samples.push_back(status);
+    });
+    auto status_input = samples;
+    status_input.insert(status_input.end(), 1'200, {0.0f, 0.0f});
+    status_decoder.feed(status_input);
+    status_decoder.flush();
+    assert(!status_samples.empty());
+    assert(status_samples.front().frames_received == 2);
+    assert(status_samples.front().frames_processed == 2);
 }

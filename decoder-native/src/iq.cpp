@@ -1,13 +1,19 @@
 #include "yurlaps_decoder/iq.hpp"
 
-#include "yurlaps_decoder/opn.hpp"
 #include "yurlaps_decoder/amb.hpp"
+#include "yurlaps_decoder/opn.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <complex>
 #include <limits>
+#include <numeric>
+#include <optional>
+#include <utility>
+#include <vector>
 
 namespace yurlaps::decoder {
 namespace {
@@ -17,49 +23,107 @@ constexpr int PREAMBLE_SYMBOLS = 16;
 constexpr int PAYLOAD_SYMBOLS = 80;
 constexpr int FRAME_SAMPLES = (PREAMBLE_SYMBOLS + PAYLOAD_SYMBOLS) * SAMPLES_PER_SYMBOL;
 constexpr int FRAME_WINDOW_SAMPLES = FRAME_SAMPLES + SAMPLES_PER_SYMBOL - 1;
-constexpr std::uint64_t QUIET_WINDOW_SAMPLES = 625'000; // 250 ms at 2.5 MS/s
+constexpr std::uint64_t QUIET_WINDOW_US = 250'000;
 constexpr float MIN_PREAMBLE_SCORE = 0.72f;
-constexpr float MIN_SIGNAL_DB = -40.0f; // bootstrap until the noise window is ready
+constexpr float MIN_SIGNAL_DB = -40.0f;
 constexpr float MIN_SNR_DB = 4.0f;
 constexpr std::size_t NOISE_WINDOW_SIZE = 4096;
 constexpr std::uint16_t OPN_PREAMBLE = 0xf9a8;
 constexpr std::uint16_t AMB_PREAMBLE = 0x51e4;
+constexpr float ADC_FULL_SCALE = 1.41421356237f;
 
 struct Candidate {
     float score = 0.0f;
     int phase = 0;
     std::complex<float> correlation{};
-    float energy = 0.0f;
     IqProtocol protocol = IqProtocol::OPN;
 };
 
-Candidate match_preamble(const std::vector<IqSample>& samples, std::size_t offset,
-                        std::uint16_t preamble, IqProtocol protocol) {
+struct FrameMetrics {
+    float signal_db{};
+    float mer_db{};
+};
+
+Candidate match_preamble(const std::vector<IqSample>& samples,
+                         std::size_t offset,
+                         std::uint16_t preamble,
+                         IqProtocol protocol) {
     Candidate best;
     for (int phase = 0; phase < SAMPLES_PER_SYMBOL; ++phase) {
         std::complex<float> correlation{};
         float energy = 0.0f;
         for (int symbol = 0; symbol < PREAMBLE_SYMBOLS; ++symbol) {
-            const auto& a = samples[offset + static_cast<std::size_t>(symbol * SAMPLES_PER_SYMBOL + phase)];
-            const std::complex<float> sample{a.i, a.q};
+            const auto& sample = samples[offset + static_cast<std::size_t>(symbol * SAMPLES_PER_SYMBOL + phase)];
+            const std::complex<float> value{sample.i, sample.q};
             const float expected = (preamble & (1u << (PREAMBLE_SYMBOLS - 1 - symbol))) ? 1.0f : -1.0f;
-            correlation += sample * expected;
-            energy += std::norm(sample);
+            correlation += value * expected;
+            energy += std::norm(value);
         }
         const float score = energy > 1e-6f
             ? std::norm(correlation) / (energy * static_cast<float>(PREAMBLE_SYMBOLS))
             : 0.0f;
-        if (score > best.score) best = {score, phase, correlation, energy, protocol};
+        if (score > best.score) best = {score, phase, correlation, protocol};
     }
     return best;
 }
 
+FrameMetrics decode_metrics(const std::vector<IqSample>& samples,
+                            std::size_t offset,
+                            int phase,
+                            const std::complex<float>& correction,
+                            std::array<std::uint8_t, PAYLOAD_SYMBOLS>& softbits) {
+    float signal = 0.0f;
+    std::vector<std::complex<float>> symbols;
+    symbols.reserve(PAYLOAD_SYMBOLS);
+    for (int symbol = 0; symbol < PAYLOAD_SYMBOLS; ++symbol) {
+        const std::size_t sample_offset = offset
+            + static_cast<std::size_t>((PREAMBLE_SYMBOLS + symbol) * SAMPLES_PER_SYMBOL + phase);
+        std::complex<float> value{};
+        for (int sample = 0; sample < SAMPLES_PER_SYMBOL; ++sample) {
+            const auto& point = samples[sample_offset + static_cast<std::size_t>(sample)];
+            value += std::complex<float>{point.i, point.q} * correction;
+        }
+        value /= static_cast<float>(SAMPLES_PER_SYMBOL);
+        symbols.push_back(value);
+        signal += std::abs(value);
+        const float normalized = std::clamp(value.real(), -1.0f, 1.0f);
+        softbits[static_cast<std::size_t>(symbol)] = static_cast<std::uint8_t>(std::clamp(
+            static_cast<int>(127.5f + normalized * 127.5f), 0, 255));
+    }
+
+    const float amplitude = std::max(signal / static_cast<float>(PAYLOAD_SYMBOLS), 1e-6f);
+    float error_power = 0.0f;
+    for (const auto& value : symbols) {
+        const float ideal_sign = value.real() >= 0.0f ? 1.0f : -1.0f;
+        const auto error = value - std::complex<float>{ideal_sign * amplitude, 0.0f};
+        error_power += std::norm(error);
+    }
+    const float evm_rms = std::sqrt(error_power / static_cast<float>(symbols.size())) / amplitude;
+    const float mer = evm_rms > 1e-6f
+        ? std::clamp(-20.0f * std::log10(evm_rms), -20.0f, 60.0f)
+        : 60.0f;
+    return {
+        20.0f * std::log10(amplitude / ADC_FULL_SCALE),
+        mer,
+    };
+}
+
 }  // namespace
 
-IqDecoder::IqDecoder(double sample_rate) : sample_rate_(sample_rate) {}
+IqDecoder::IqDecoder(double sample_rate)
+    : sample_rate_(sample_rate),
+      next_status_sample_(static_cast<std::uint64_t>(std::llround(sample_rate))) {}
 
 void IqDecoder::set_callback(PassingCallback callback) {
     callback_ = std::move(callback);
+}
+
+void IqDecoder::set_status_callback(StatusCallback callback) {
+    status_callback_ = std::move(callback);
+}
+
+void IqDecoder::set_time_sync_callback(TimeSyncCallback callback) {
+    time_sync_callback_ = std::move(callback);
 }
 
 void IqDecoder::feed(const std::uint8_t* interleaved_iq, std::size_t byte_count) {
@@ -75,173 +139,282 @@ void IqDecoder::feed(const std::uint8_t* interleaved_iq, std::size_t byte_count)
     feed(samples);
 }
 
-void IqDecoder::feed(const std::vector<IqSample>& samples) {
-    observe_noise(samples);
-    buffer_.insert(buffer_.end(), samples.begin(), samples.end());
-    scan();
+void IqDecoder::feed(const std::uint8_t* interleaved_iq,
+                     std::size_t byte_count,
+                     std::uint64_t host_timestamp_us) {
+    if (!interleaved_iq || byte_count < 2) return;
+    std::vector<IqSample> samples;
+    samples.reserve(byte_count / 2);
+    for (std::size_t i = 0; i + 1 < byte_count; i += 2) {
+        samples.push_back({
+            (static_cast<float>(interleaved_iq[i]) - 127.5f) / 127.5f,
+            (static_cast<float>(interleaved_iq[i + 1]) - 127.5f) / 127.5f,
+        });
+    }
+    feed(samples, host_timestamp_us);
 }
 
-void IqDecoder::observe_noise(const std::vector<IqSample>& samples) {
-    for (const auto& sample : samples) {
-        noise_window_.push_back(std::hypot(sample.i, sample.q));
-        if (noise_window_.size() > NOISE_WINDOW_SIZE) noise_window_.pop_front();
+void IqDecoder::feed(const std::vector<IqSample>& samples) {
+    feed_samples(samples, std::nullopt);
+}
+
+void IqDecoder::feed(const std::vector<IqSample>& samples, std::uint64_t host_timestamp_us) {
+    feed_samples(samples, host_timestamp_us);
+}
+
+void IqDecoder::feed_samples(const std::vector<IqSample>& samples,
+                             std::optional<std::uint64_t> host_timestamp_us) {
+    if (samples.empty()) return;
+
+    const std::uint64_t buffer_start_sample = current_sample_index();
+    if (host_timestamp_us) {
+        if (!has_host_timebase_) {
+            host_timebase_anchor_us_ = *host_timestamp_us - static_cast<std::uint64_t>(
+                std::llround(static_cast<double>(buffer_start_sample) * 1'000'000.0 / sample_rate_));
+            has_host_timebase_ = true;
+        }
+        if (has_last_host_timestamp_) {
+            const double expected_us = static_cast<double>(samples.size()) * 1'000'000.0 / sample_rate_;
+            const double actual_us = static_cast<double>(*host_timestamp_us - last_host_timestamp_us_);
+            const auto error_us = static_cast<std::uint64_t>(std::llround(std::fabs(actual_us - expected_us)));
+            jitter_history_.push_back({*host_timestamp_us, error_us});
+            while (!jitter_history_.empty() && *host_timestamp_us - jitter_history_.front().first > 5'000'000) {
+                jitter_history_.pop_front();
+            }
+        }
+        last_host_timestamp_us_ = *host_timestamp_us;
+        has_last_host_timestamp_ = true;
     }
+
+    buffer_.insert(buffer_.end(), samples.begin(), samples.end());
+    const bool frame_seen = scan();
+    observe_noise(samples, frame_seen);
+    flush_expired(current_sample_index());
+    maybe_emit_status();
 }
 
 float IqDecoder::noise_floor_db() const {
-    if (noise_window_.empty()) return -120.0f;
-    std::vector<float> values(noise_window_.begin(), noise_window_.end());
-    const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
-    std::nth_element(values.begin(), middle, values.end());
-    // For complex Gaussian noise, median magnitude is below RMS by about 1.18.
-    const float rms_estimate = std::max(*middle * 1.18f, 1e-6f);
-    return 20.0f * std::log10(rms_estimate);
+    if (noise_power_window_.empty()) return -std::numeric_limits<float>::infinity();
+    const double power = std::accumulate(noise_power_window_.begin(), noise_power_window_.end(), 0.0)
+        / static_cast<double>(noise_power_window_.size());
+    return static_cast<float>(10.0 * std::log10(std::max(power, 1e-12) /
+                                                 (ADC_FULL_SCALE * ADC_FULL_SCALE)));
+}
+
+void IqDecoder::observe_noise(const std::vector<IqSample>& samples, bool frame_seen) {
+    if (frame_seen) return;
+    for (const auto& sample : samples) {
+        noise_power_window_.push_back(std::norm(std::complex<float>{sample.i, sample.q}));
+        if (noise_power_window_.size() > NOISE_WINDOW_SIZE) noise_power_window_.pop_front();
+        dc_sum_i_ += sample.i;
+        dc_sum_q_ += sample.q;
+        ++dc_sample_count_;
+    }
+}
+
+bool IqDecoder::accept_amb(std::uint64_t sample_index,
+                           std::uint32_t id,
+                           std::uint8_t status) {
+    if (id == 0 || id >= 10'000'000u) return false;
+
+    const std::uint8_t upper = static_cast<std::uint8_t>(status & 0xf8u);
+    const std::uint8_t counter = static_cast<std::uint8_t>(status & 0x07u);
+    if (upper == 0xf8u && counter != 0) {
+        if (status != 0xffu) {
+            amb_validation_timestamps_[upper] = sample_index;
+        } else {
+            const auto found = amb_validation_timestamps_.find(upper);
+            const std::uint64_t quiet_samples = static_cast<std::uint64_t>(
+                std::llround(QUIET_WINDOW_US * sample_rate_ / 1'000'000.0));
+            if (found != amb_validation_timestamps_.end()
+                && sample_index <= found->second + quiet_samples) {
+                banned_amb_ids_.insert(id);
+            }
+        }
+    }
+
+    if (status == 0xffu && !is_amb_banned(id)) return true;
+    return counter == 0 && !is_amb_banned(id);
+}
+
+bool IqDecoder::is_amb_banned(std::uint32_t id) const {
+    return banned_amb_ids_.find(id) != banned_amb_ids_.end();
 }
 
 void IqDecoder::flush() {
-    std::vector<Pending> ready;
-    ready.reserve(pending_.size());
-    for (auto& [key, pending] : pending_) {
-        (void)key;
-        ready.push_back(std::move(pending));
+    flush_expired(current_sample_index() + static_cast<std::uint64_t>(
+        std::llround(QUIET_WINDOW_US * sample_rate_ / 1'000'000.0)));
+}
+
+std::uint64_t IqDecoder::timestamp_for_sample(std::uint64_t sample_index) const {
+    const auto offset = static_cast<std::uint64_t>(std::llround(
+        static_cast<double>(sample_index) * 1'000'000.0 / sample_rate_));
+    return has_host_timebase_ ? host_timebase_anchor_us_ + offset : offset;
+}
+
+std::uint64_t IqDecoder::current_sample_index() const noexcept {
+    return absolute_samples_ + buffer_.size();
+}
+
+double IqDecoder::jitter_p95_ms() const {
+    if (jitter_history_.size() < 20) return 0.0;
+    std::vector<std::uint64_t> values;
+    values.reserve(jitter_history_.size());
+    for (const auto& entry : jitter_history_) values.push_back(entry.second);
+    const std::size_t k = values.size() * 95 / 100;
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(k), values.end());
+    return static_cast<double>(values[k]) / 1000.0;
+}
+
+void IqDecoder::maybe_emit_status() {
+    const std::uint64_t now_sample = current_sample_index();
+    if (now_sample < next_status_sample_) return;
+    if (status_callback_) {
+        const double dc = dc_sample_count_ > 0
+            ? std::hypot(dc_sum_i_ / static_cast<double>(dc_sample_count_),
+                         dc_sum_q_ / static_cast<double>(dc_sample_count_)) * 127.5
+            : 0.0;
+        status_callback_({
+            timestamp_for_sample(now_sample),
+            noise_floor_db(),
+            static_cast<float>(dc),
+            frames_received_,
+            frames_processed_,
+            jitter_p95_ms(),
+        });
     }
-    pending_.clear();
-    std::sort(ready.begin(), ready.end(), [](const Pending& left, const Pending& right) {
-        return left.passing.sample_index < right.passing.sample_index;
-    });
-    for (auto& pending : ready) emit(pending);
+    frames_received_ = 0;
+    frames_processed_ = 0;
+    dc_sum_i_ = 0.0;
+    dc_sum_q_ = 0.0;
+    dc_sample_count_ = 0;
+    while (next_status_sample_ <= now_sample) {
+        next_status_sample_ += static_cast<std::uint64_t>(std::llround(sample_rate_));
+    }
 }
 
 void IqDecoder::emit(Pending& pending) {
-    if (!callback_) return;
-    pending.passing.sample_index = pending.weight_sum > 0.0
-        ? static_cast<std::uint64_t>(std::llround(pending.weighted_sample_sum / pending.weight_sum))
-        : (pending.first_sample + pending.last_sample) / 2;
-    pending.passing.timestamp_us = static_cast<std::uint64_t>(std::llround(
-        static_cast<double>(pending.passing.sample_index) * 1'000'000.0 / sample_rate_));
-    pending.passing.duration_us = static_cast<std::uint64_t>(std::llround(
-        static_cast<double>(pending.last_sample - pending.first_sample) * 1'000'000.0 / sample_rate_));
-    callback_(pending.passing);
+    if (pending.hits.size() < 2 || is_amb_banned(pending.id) || !callback_) return;
+    const auto estimate = estimate_passing(pending.hits, sample_rate_);
+    IqPassing passing{
+        estimate.sample_index,
+        timestamp_for_sample(estimate.sample_index),
+        pending.protocol,
+        pending.id,
+        estimate.rssi_db,
+        static_cast<std::uint32_t>(pending.hits.size()),
+        estimate.duration_us,
+        estimate.mer_db,
+    };
+    callback_(passing);
 }
 
 void IqDecoder::flush_expired(std::uint64_t now_sample) {
+    const std::uint64_t quiet_samples = static_cast<std::uint64_t>(
+        std::llround(QUIET_WINDOW_US * sample_rate_ / 1'000'000.0));
     std::vector<Pending> ready;
     for (auto it = pending_.begin(); it != pending_.end();) {
-        if (now_sample > it->second.last_sample && now_sample - it->second.last_sample > QUIET_WINDOW_SAMPLES) {
+        if (it->second.hits.empty()) {
+            it = pending_.erase(it);
+            continue;
+        }
+        const auto last = it->second.hits.back().sample_index;
+        if (now_sample > last && now_sample - last > quiet_samples) {
             ready.push_back(std::move(it->second));
             it = pending_.erase(it);
         } else {
             ++it;
         }
     }
-    std::sort(ready.begin(), ready.end(), [](const Pending& left, const Pending& right) {
-        return left.passing.sample_index < right.passing.sample_index;
+    std::sort(ready.begin(), ready.end(), [this](const Pending& left, const Pending& right) {
+        const auto left_point = estimate_passing(left.hits, sample_rate_).sample_index;
+        const auto right_point = estimate_passing(right.hits, sample_rate_).sample_index;
+        return left_point < right_point;
     });
     for (auto& pending : ready) emit(pending);
 }
 
 void IqDecoder::add_hit(const IqPassing& hit) {
     const auto key = (static_cast<std::uint64_t>(hit.protocol == IqProtocol::AMB) << 32u) | hit.id;
-    flush_expired(hit.sample_index);
     auto found = pending_.find(key);
     if (found == pending_.end()) {
-        const double weight = std::max(0.001, std::pow(10.0, static_cast<double>(hit.rssi_db) / 20.0));
-        pending_.emplace(key, Pending{hit, hit.sample_index, hit.sample_index,
-                                      static_cast<double>(hit.sample_index) * weight, weight});
+        Pending pending{hit.protocol, hit.id, {HitSample{hit.sample_index, hit.rssi_db, hit.mer_db}}};
+        pending_.emplace(key, std::move(pending));
         return;
     }
-    auto& pending = found->second;
-    pending.last_sample = hit.sample_index;
-    const double weight = std::max(0.001, std::pow(10.0, static_cast<double>(hit.rssi_db) / 20.0));
-    pending.weighted_sample_sum += static_cast<double>(hit.sample_index) * weight;
-    pending.weight_sum += weight;
-    pending.passing.hits += hit.hits;
-    pending.passing.rssi_db = std::max(pending.passing.rssi_db, hit.rssi_db);
+    found->second.hits.push_back({hit.sample_index, hit.rssi_db, hit.mer_db});
 }
 
-void IqDecoder::scan() {
+bool IqDecoder::scan() {
     std::size_t cursor = 0;
+    bool frame_seen = false;
     while (buffer_.size() - cursor >= static_cast<std::size_t>(FRAME_WINDOW_SAMPLES)) {
         Candidate best;
         std::size_t best_offset = cursor;
-        // A preamble can start at either sample phase. Scan the entire current
-        // window and keep only the strongest normalized correlation.
         for (std::size_t offset = cursor;
              offset + FRAME_WINDOW_SAMPLES <= buffer_.size(); ++offset) {
             for (const auto [preamble, protocol] : {
                      std::pair<std::uint16_t, IqProtocol>{OPN_PREAMBLE, IqProtocol::OPN},
                      std::pair<std::uint16_t, IqProtocol>{AMB_PREAMBLE, IqProtocol::AMB}}) {
                 const auto candidate = match_preamble(buffer_, offset, preamble, protocol);
-                if (candidate.score > best.score) { best = candidate; best_offset = offset; }
+                if (candidate.score > best.score) {
+                    best = candidate;
+                    best_offset = offset;
+                }
             }
         }
 
-        // Noise has no stable phase relationship with the Barker preamble.
-        // This threshold is deliberately conservative; sensitivity tuning is
-        // measured with captures, not hidden in the race engine.
         if (best.score < MIN_PREAMBLE_SCORE) {
             cursor = buffer_.size() - static_cast<std::size_t>(FRAME_WINDOW_SAMPLES) + 1;
             break;
         }
+        frame_seen = true;
+        const std::complex<float> correction = std::polar(1.0f, -std::arg(best.correlation));
+        std::array<std::uint8_t, PAYLOAD_SYMBOLS> softbits{};
+        const auto metrics = decode_metrics(buffer_, best_offset, best.phase, correction, softbits);
 
-        const float phase = std::arg(best.correlation);
-        const std::complex<float> correction = std::polar(1.0f, -phase);
-        std::array<std::uint8_t, 80> softbits{};
-        float signal = 0.0f;
-        for (int symbol = 0; symbol < PAYLOAD_SYMBOLS; ++symbol) {
-            const std::size_t sample_offset = best_offset
-                + static_cast<std::size_t>((PREAMBLE_SYMBOLS + symbol) * SAMPLES_PER_SYMBOL + best.phase);
-            std::complex<float> value{};
-            for (int s = 0; s < SAMPLES_PER_SYMBOL; ++s) {
-                const auto& a = buffer_[sample_offset + static_cast<std::size_t>(s)];
-                value += std::complex<float>{a.i, a.q} * correction;
-            }
-            value /= static_cast<float>(SAMPLES_PER_SYMBOL);
-            signal += std::abs(value);
-            const float normalized = std::clamp(value.real() / 1.0f, -1.0f, 1.0f);
-            softbits[symbol] = static_cast<std::uint8_t>(std::clamp(
-                static_cast<int>(127.5f + normalized * 127.5f), 0, 255));
-        }
-
+        ++frames_received_;
+        const float noise_db = noise_floor_db();
+        const bool noise_ready = std::isfinite(noise_db) && noise_power_window_.size() >= 256;
+        const bool signal_above_noise = noise_ready
+            ? (metrics.signal_db - noise_db >= MIN_SNR_DB)
+            : (metrics.signal_db >= MIN_SIGNAL_DB);
+        bool frame_processed = false;
         std::optional<std::uint32_t> id;
+        std::uint8_t amb_status = 0;
         if (best.protocol == IqProtocol::OPN) {
             id = decode_opn(softbits);
+            frame_processed = id.has_value() && signal_above_noise;
         } else if (const auto frame = decode_amb_rc3(softbits)) {
-            // RC3 status frames have the low three bits clear; other status
-            // values are retained for the caller to classify later.
             id = frame->id;
+            amb_status = frame->status;
+            frame_processed = signal_above_noise && *id != 0
+                && (*id < 10'000'000u || (amb_status & 0x07u) == 0);
         }
-        const float average_signal = signal / static_cast<float>(PAYLOAD_SYMBOLS);
-        const float signal_db = 20.0f * std::log10(std::max(average_signal, 1e-6f));
-        const float noise_db = noise_floor_db();
-        const bool noise_ready = noise_window_.size() >= 256;
-        const bool signal_above_noise = noise_ready
-            ? (signal_db - noise_db >= MIN_SNR_DB)
-            : (signal_db >= MIN_SIGNAL_DB);
-        const bool usable_id = id && (best.protocol == IqProtocol::OPN || *id != 0);
-        if (usable_id && signal_above_noise) {
-            const std::uint64_t sample_index = absolute_samples_ + best_offset
-                + static_cast<std::uint64_t>(PREAMBLE_SYMBOLS * SAMPLES_PER_SYMBOL);
-            add_hit({
-                sample_index,
-                static_cast<std::uint64_t>(std::llround(
-                    static_cast<double>(sample_index) * 1'000'000.0 / sample_rate_)),
-                best.protocol,
-                *id,
-                signal_db,
-                1,
-                0,
-            });
-            cursor = best_offset + static_cast<std::size_t>(FRAME_SAMPLES);
-        } else {
-            cursor = best_offset + 1;
+        if (frame_processed) ++frames_processed_;
+
+        const std::uint64_t preamble_sample = absolute_samples_ + best_offset;
+        if (signal_above_noise && id && best.protocol == IqProtocol::OPN) {
+            if (*id < 10'000'000u) {
+                add_hit({preamble_sample, timestamp_for_sample(preamble_sample), best.protocol,
+                         *id, metrics.signal_db, 1, 0, metrics.mer_db});
+            } else if ((*id & 0x00a00000u) == 0x00a00000u && time_sync_callback_) {
+                time_sync_callback_({timestamp_for_sample(preamble_sample), *id,
+                                      *id & 0x000fffffu});
+            }
+        } else if (signal_above_noise && id && best.protocol == IqProtocol::AMB
+                   && accept_amb(preamble_sample, *id, amb_status)) {
+            add_hit({preamble_sample, timestamp_for_sample(preamble_sample), best.protocol,
+                     *id, metrics.signal_db, 1, 0, metrics.mer_db});
         }
+        cursor = best_offset + static_cast<std::size_t>(FRAME_SAMPLES);
     }
 
     if (cursor > 0) {
         buffer_.erase(buffer_.begin(), buffer_.begin() + static_cast<std::ptrdiff_t>(cursor));
         absolute_samples_ += cursor;
     }
+    return frame_seen;
 }
 
 }  // namespace yurlaps::decoder

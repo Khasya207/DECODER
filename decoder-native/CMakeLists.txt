@@ -12,6 +12,7 @@ add_library(yurlaps_decoder_core
     src/protocol.cpp
     src/opn.cpp
     src/iq.cpp
+    src/passing.cpp
     src/amb.cpp
     src/rtl.cpp
     src/zmq.cpp
@@ -52,3 +53,7 @@ add_test(NAME iq_test COMMAND iq_test)
 add_executable(amb_test tests/amb_test.cpp)
 target_link_libraries(amb_test PRIVATE yurlaps_decoder_core)
 add_test(NAME amb_test COMMAND amb_test)
+
+add_executable(passing_test tests/passing_test.cpp)
+target_link_libraries(passing_test PRIVATE yurlaps_decoder_core)
+add_test(NAME passing_test COMMAND passing_test)

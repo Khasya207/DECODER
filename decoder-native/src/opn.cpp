@@ -97,7 +97,7 @@ std::optional<std::uint32_t> decode_opn(const std::array<std::uint8_t, 80>& soft
     if (crc8({bytes[0], bytes[1], bytes[2]}) != bytes[3]) return std::nullopt;
     const std::uint32_t id = (static_cast<std::uint32_t>(bytes[0]) << 16u)
         | (static_cast<std::uint32_t>(bytes[1]) << 8u) | bytes[2];
-    return id <= 9999999u ? std::optional<std::uint32_t>(id) : std::nullopt;
+    return id;
 }
 
 }  // namespace yurlaps::decoder

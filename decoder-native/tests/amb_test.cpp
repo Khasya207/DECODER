@@ -50,9 +50,11 @@ int main() {
         samples.push_back({value, 0.0f});
         samples.push_back({value, 0.0f});
     };
-    for (int bit = 0; bit < 16; ++bit) symbol((preamble & (1u << (15 - bit))) ? 0.8f : -0.8f);
-    for (const auto value : encoded) symbol(value ? 0.8f : -0.8f);
-    samples.push_back({0.0f, 0.0f});
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        for (int bit = 0; bit < 16; ++bit) symbol((preamble & (1u << (15 - bit))) ? 0.8f : -0.8f);
+        for (const auto value : encoded) symbol(value ? 0.8f : -0.8f);
+        samples.push_back({0.0f, 0.0f});
+    }
 
     std::vector<yurlaps::decoder::IqPassing> passings;
     yurlaps::decoder::IqDecoder decoder;
@@ -62,4 +64,6 @@ int main() {
     assert(passings.size() == 1);
     assert(passings.front().protocol == yurlaps::decoder::IqProtocol::AMB);
     assert(passings.front().id == id);
+    assert(passings.front().hits == 2);
+    assert(passings.front().mer_db > 20.0f);
 }
