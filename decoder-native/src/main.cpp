@@ -100,8 +100,10 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::string(argv[1]) == "--rtl") {
         yurlaps::decoder::RtlOptions options;
-        if (argc >= 3) options.serial = argv[2];
-        if (argc >= 4) options.gain_db = std::stoi(argv[3]);
+        int next = 2;
+        if (next < argc && std::string(argv[next]) != "--debug") options.serial = argv[next++];
+        if (next < argc && std::string(argv[next]) != "--debug") options.gain_db = std::stoi(argv[next++]);
+        const bool debug = next < argc && std::string(argv[next]) == "--debug";
         yurlaps::decoder::IqDecoder decoder;
         yurlaps::decoder::Publisher publisher;
         std::string publisher_error;
@@ -117,7 +119,7 @@ int main(int argc, char** argv) {
             std::cout << line.str() << '\n' << std::flush;
             publisher.send(line.str());
         });
-        if (argc >= 5 && std::string(argv[4]) == "--debug") enable_debug(decoder);
+        if (debug) enable_debug(decoder);
         decoder.set_status_callback([&publisher](const yurlaps::decoder::IqStatus& status) {
             std::ostringstream line;
             line << "S " << status.timestamp_us / 1000 << ' '
