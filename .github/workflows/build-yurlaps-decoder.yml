@@ -1,0 +1,63 @@
+name: Build YurLaps Decoder Native
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          cache: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-rtl-sdr
+            mingw-w64-ucrt-x86_64-zeromq
+            mingw-w64-ucrt-x86_64-cppzmq
+            mingw-w64-ucrt-x86_64-libusb
+            git
+            zip
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          set -eu
+          cmake -G Ninja -S decoder-native -B decoder-native/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DYURLAPS_WITH_RTLSDR=ON \
+            -DYURLAPS_WITH_ZMQ=ON
+      - name: Build and test
+        shell: msys2 {0}
+        run: |
+          set -eu
+          cmake --build decoder-native/build
+          ctest --test-dir decoder-native/build --output-on-failure
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          set -eu
+          mkdir -p decoder-out
+          cp decoder-native/build/YurLapsDecoder.exe decoder-out/
+          for dll in /ucrt64/bin/librtlsdr*.dll /ucrt64/bin/libusb-1.0*.dll \
+                     /ucrt64/bin/libzmq*.dll /ucrt64/bin/libsodium*.dll \
+                     /ucrt64/bin/libgcc_s_seh-1.dll /ucrt64/bin/libstdc++-6.dll \
+                     /ucrt64/bin/libwinpthread-1.dll /ucrt64/bin/libc++.dll; do
+            test -e "$dll" && cp "$dll" decoder-out/ || true
+          done
+          ls -la decoder-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: YurLapsDecoder-native-windows-x64
+          path: decoder-out
+          if-no-files-found: error
