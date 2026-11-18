@@ -78,11 +78,17 @@ void IqDecoder::feed(const std::vector<IqSample>& samples) {
 }
 
 void IqDecoder::flush() {
+    std::vector<Pending> ready;
+    ready.reserve(pending_.size());
     for (auto& [key, pending] : pending_) {
         (void)key;
-        emit(pending);
+        ready.push_back(std::move(pending));
     }
     pending_.clear();
+    std::sort(ready.begin(), ready.end(), [](const Pending& left, const Pending& right) {
+        return left.passing.sample_index < right.passing.sample_index;
+    });
+    for (auto& pending : ready) emit(pending);
 }
 
 void IqDecoder::emit(Pending& pending) {
@@ -96,14 +102,19 @@ void IqDecoder::emit(Pending& pending) {
 }
 
 void IqDecoder::flush_expired(std::uint64_t now_sample) {
+    std::vector<Pending> ready;
     for (auto it = pending_.begin(); it != pending_.end();) {
         if (now_sample > it->second.last_sample && now_sample - it->second.last_sample > QUIET_WINDOW_SAMPLES) {
-            emit(it->second);
+            ready.push_back(std::move(it->second));
             it = pending_.erase(it);
         } else {
             ++it;
         }
     }
+    std::sort(ready.begin(), ready.end(), [](const Pending& left, const Pending& right) {
+        return left.passing.sample_index < right.passing.sample_index;
+    });
+    for (auto& pending : ready) emit(pending);
 }
 
 void IqDecoder::add_hit(const IqPassing& hit) {
