@@ -81,6 +81,15 @@ int main() {
     assert(passings.front().mer_db > 20.0f);
     assert(passings.front().duration_us == 0);
 
+    yurlaps::decoder::IqDecoder single_decoder;
+    std::vector<yurlaps::decoder::IqPassing> single_passings;
+    single_decoder.set_callback([&single_passings](const yurlaps::decoder::IqPassing& passing) {
+        single_passings.push_back(passing);
+    });
+    single_decoder.feed(std::vector<yurlaps::decoder::IqSample>(samples.begin(), samples.begin() + 193));
+    single_decoder.flush();
+    assert(single_passings.empty());
+
     yurlaps::decoder::IqDecoder status_decoder(1'000.0);
     std::vector<yurlaps::decoder::IqStatus> status_samples;
     status_decoder.set_status_callback([&status_samples](const yurlaps::decoder::IqStatus& status) {
