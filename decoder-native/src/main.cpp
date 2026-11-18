@@ -50,10 +50,43 @@ int run_iq(const std::string& path) {
     return 0;
 }
 
+void enable_debug(yurlaps::decoder::IqDecoder& decoder) {
+    decoder.set_hit_callback([](const yurlaps::decoder::IqHit& hit) {
+        std::cout << "H " << hit.timestamp_us / 1000 << ' '
+                  << (hit.protocol == yurlaps::decoder::IqProtocol::OPN ? "OPN" : "AMB")
+                  << ' ' << hit.id << ' ' << std::fixed << std::setprecision(2)
+                  << hit.rssi_db << ' ' << std::setprecision(1) << hit.mer_db
+                  << ' ' << static_cast<unsigned>(hit.status) << '\n' << std::flush;
+    });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 3 && std::string(argv[1]) == "--iq") return run_iq(argv[2]);
+    if (argc >= 3 && std::string(argv[1]) == "--iq") {
+        if (argc >= 4 && std::string(argv[3]) == "--debug") {
+            std::ifstream input(argv[2], std::ios::binary);
+            if (!input) return 2;
+            yurlaps::decoder::IqDecoder decoder;
+            enable_debug(decoder);
+            decoder.set_callback([](const yurlaps::decoder::IqPassing& passing) {
+                std::cout << "P " << passing.timestamp_us / 1000 << ' '
+                          << (passing.protocol == yurlaps::decoder::IqProtocol::OPN ? "OPN" : "AMB")
+                          << ' ' << passing.id << ' ' << std::fixed << std::setprecision(2)
+                          << passing.rssi_db << ' ' << passing.hits << ' ' << passing.duration_us
+                          << ' ' << std::setprecision(1) << passing.mer_db << '\n' << std::flush;
+            });
+            std::vector<std::uint8_t> chunk(64 * 1024);
+            while (input) {
+                input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+                const auto count = input.gcount();
+                if (count > 0) decoder.feed(chunk.data(), static_cast<std::size_t>(count));
+            }
+            decoder.flush();
+            return 0;
+        }
+        return run_iq(argv[2]);
+    }
     if (argc >= 2 && std::string(argv[1]) == "--rtl") {
         yurlaps::decoder::RtlOptions options;
         if (argc >= 3) options.serial = argv[2];
@@ -73,6 +106,7 @@ int main(int argc, char** argv) {
             std::cout << line.str() << '\n' << std::flush;
             publisher.send(line.str());
         });
+        if (argc >= 5 && std::string(argv[4]) == "--debug") enable_debug(decoder);
         decoder.set_status_callback([&publisher](const yurlaps::decoder::IqStatus& status) {
             std::ostringstream line;
             line << "S " << status.timestamp_us / 1000 << ' '

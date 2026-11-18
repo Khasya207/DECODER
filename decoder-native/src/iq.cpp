@@ -135,6 +135,10 @@ void IqDecoder::set_callback(PassingCallback callback) {
     callback_ = std::move(callback);
 }
 
+void IqDecoder::set_hit_callback(HitCallback callback) {
+    hit_callback_ = std::move(callback);
+}
+
 void IqDecoder::set_status_callback(StatusCallback callback) {
     status_callback_ = std::move(callback);
 }
@@ -417,6 +421,10 @@ bool IqDecoder::scan() {
         const std::uint64_t preamble_sample = absolute_samples_ + best_offset;
         if (signal_above_noise && id && best.protocol == IqProtocol::OPN) {
             if (*id < 10'000'000u) {
+                if (hit_callback_) {
+                    hit_callback_({preamble_sample, timestamp_for_sample(preamble_sample), best.protocol,
+                                   *id, metrics.signal_db, metrics.mer_db, 0});
+                }
                 add_hit({preamble_sample, timestamp_for_sample(preamble_sample), best.protocol,
                          *id, metrics.signal_db, 1, 0, metrics.mer_db});
             } else if ((*id & 0x00a00000u) == 0x00a00000u && time_sync_callback_) {
@@ -425,6 +433,10 @@ bool IqDecoder::scan() {
             }
         } else if (signal_above_noise && id && best.protocol == IqProtocol::AMB
                    && accept_amb(preamble_sample, *id, amb_status)) {
+            if (hit_callback_) {
+                hit_callback_({preamble_sample, timestamp_for_sample(preamble_sample), best.protocol,
+                               *id, metrics.signal_db, metrics.mer_db, amb_status});
+            }
             add_hit({preamble_sample, timestamp_for_sample(preamble_sample), best.protocol,
                      *id, metrics.signal_db, 1, 0, metrics.mer_db});
         }

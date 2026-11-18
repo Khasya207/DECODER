@@ -34,6 +34,18 @@ struct IqPassing {
 
 using PassingCallback = std::function<void(const IqPassing&)>;
 
+struct IqHit {
+    std::uint64_t sample_index{};
+    std::uint64_t timestamp_us{};
+    IqProtocol protocol{IqProtocol::OPN};
+    std::uint32_t id{};
+    float rssi_db{};
+    float mer_db{};
+    std::uint8_t status{};
+};
+
+using HitCallback = std::function<void(const IqHit&)>;
+
 struct IqStatus {
     std::uint64_t timestamp_us{};
     float noise_floor_db{};
@@ -61,6 +73,7 @@ public:
     explicit IqDecoder(double sample_rate = 2'500'000.0);
 
     void set_callback(PassingCallback callback);
+    void set_hit_callback(HitCallback callback);
     void set_status_callback(StatusCallback callback);
     void set_time_sync_callback(TimeSyncCallback callback);
     void feed(const std::uint8_t* interleaved_iq, std::size_t byte_count);
@@ -81,6 +94,7 @@ private:
     std::uint64_t dc_sample_count_ = 0;
     std::uint64_t absolute_samples_ = 0;
     PassingCallback callback_;
+    HitCallback hit_callback_;
     StatusCallback status_callback_;
     TimeSyncCallback time_sync_callback_;
 
