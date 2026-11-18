@@ -76,6 +76,17 @@ int main(int argc, char** argv) {
                           << passing.rssi_db << ' ' << passing.hits << ' ' << passing.duration_us
                           << ' ' << std::setprecision(1) << passing.mer_db << '\n' << std::flush;
             });
+            decoder.set_status_callback([](const yurlaps::decoder::IqStatus& status) {
+                std::cout << "S " << status.timestamp_us / 1000 << ' '
+                          << std::fixed << std::setprecision(2) << status.noise_floor_db
+                          << ' ' << status.dc_offset << ' ' << status.frames_received
+                          << ' ' << status.frames_processed << ' '
+                          << std::setprecision(2) << status.jitter_p95_ms << '\n' << std::flush;
+            });
+            decoder.set_time_sync_callback([](const yurlaps::decoder::IqTimeSync& sync) {
+                std::cout << "T " << sync.timestamp_us / 1000 << " OPN " << sync.transponder_id
+                          << ' ' << sync.transponder_timecode << '\n' << std::flush;
+            });
             std::vector<std::uint8_t> chunk(64 * 1024);
             while (input) {
                 input.read(reinterpret_cast<char*>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
