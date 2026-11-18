@@ -19,7 +19,9 @@ constexpr int FRAME_SAMPLES = (PREAMBLE_SYMBOLS + PAYLOAD_SYMBOLS) * SAMPLES_PER
 constexpr int FRAME_WINDOW_SAMPLES = FRAME_SAMPLES + SAMPLES_PER_SYMBOL - 1;
 constexpr std::uint64_t QUIET_WINDOW_SAMPLES = 625'000; // 250 ms at 2.5 MS/s
 constexpr float MIN_PREAMBLE_SCORE = 0.72f;
-constexpr float MIN_SIGNAL_DB = -40.0f;
+constexpr float MIN_SIGNAL_DB = -40.0f; // bootstrap until the noise window is ready
+constexpr float MIN_SNR_DB = 4.0f;
+constexpr std::size_t NOISE_WINDOW_SIZE = 4096;
 constexpr std::uint16_t OPN_PREAMBLE = 0xf9a8;
 constexpr std::uint16_t AMB_PREAMBLE = 0x51e4;
 
@@ -62,19 +64,38 @@ void IqDecoder::set_callback(PassingCallback callback) {
 
 void IqDecoder::feed(const std::uint8_t* interleaved_iq, std::size_t byte_count) {
     if (!interleaved_iq || byte_count < 2) return;
-    buffer_.reserve(buffer_.size() + byte_count / 2);
+    std::vector<IqSample> samples;
+    samples.reserve(byte_count / 2);
     for (std::size_t i = 0; i + 1 < byte_count; i += 2) {
-        buffer_.push_back({
+        samples.push_back({
             (static_cast<float>(interleaved_iq[i]) - 127.5f) / 127.5f,
             (static_cast<float>(interleaved_iq[i + 1]) - 127.5f) / 127.5f,
         });
     }
-    scan();
+    feed(samples);
 }
 
 void IqDecoder::feed(const std::vector<IqSample>& samples) {
+    observe_noise(samples);
     buffer_.insert(buffer_.end(), samples.begin(), samples.end());
     scan();
+}
+
+void IqDecoder::observe_noise(const std::vector<IqSample>& samples) {
+    for (const auto& sample : samples) {
+        noise_window_.push_back(std::hypot(sample.i, sample.q));
+        if (noise_window_.size() > NOISE_WINDOW_SIZE) noise_window_.pop_front();
+    }
+}
+
+float IqDecoder::noise_floor_db() const {
+    if (noise_window_.empty()) return -120.0f;
+    std::vector<float> values(noise_window_.begin(), noise_window_.end());
+    const auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+    std::nth_element(values.begin(), middle, values.end());
+    // For complex Gaussian noise, median magnitude is below RMS by about 1.18.
+    const float rms_estimate = std::max(*middle * 1.18f, 1e-6f);
+    return 20.0f * std::log10(rms_estimate);
 }
 
 void IqDecoder::flush() {
@@ -192,8 +213,13 @@ void IqDecoder::scan() {
         }
         const float average_signal = signal / static_cast<float>(PAYLOAD_SYMBOLS);
         const float signal_db = 20.0f * std::log10(std::max(average_signal, 1e-6f));
+        const float noise_db = noise_floor_db();
+        const bool noise_ready = noise_window_.size() >= 256;
+        const bool signal_above_noise = noise_ready
+            ? (signal_db - noise_db >= MIN_SNR_DB)
+            : (signal_db >= MIN_SIGNAL_DB);
         const bool usable_id = id && (best.protocol == IqProtocol::OPN || *id != 0);
-        if (usable_id && signal_db >= MIN_SIGNAL_DB) {
+        if (usable_id && signal_above_noise) {
             const std::uint64_t sample_index = absolute_samples_ + best_offset
                 + static_cast<std::uint64_t>(PREAMBLE_SYMBOLS * SAMPLES_PER_SYMBOL);
             add_hit({

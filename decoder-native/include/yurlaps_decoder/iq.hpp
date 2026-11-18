@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <unordered_map>
 #include <vector>
@@ -44,6 +45,7 @@ public:
 private:
     double sample_rate_;
     std::vector<IqSample> buffer_;
+    std::deque<float> noise_window_;
     std::uint64_t absolute_samples_ = 0;
     PassingCallback callback_;
 
@@ -57,6 +59,8 @@ private:
     std::unordered_map<std::uint64_t, Pending> pending_;
 
     void scan();
+    void observe_noise(const std::vector<IqSample>& samples);
+    float noise_floor_db() const;
     void add_hit(const IqPassing& hit);
     void flush_expired(std::uint64_t now_sample);
     void emit(Pending& pending);
