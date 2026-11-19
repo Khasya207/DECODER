@@ -66,7 +66,10 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::string(argv[1]) == "--iq") {
         if (argc >= 4 && std::string(argv[3]) == "--debug") {
             std::ifstream input(argv[2], std::ios::binary);
-            if (!input) return 2;
+            if (!input) {
+                std::cerr << "cannot open IQ capture: " << argv[2] << '\n';
+                return 2;
+            }
             yurlaps::decoder::IqDecoder decoder;
             enable_debug(decoder);
             decoder.set_callback([](const yurlaps::decoder::IqPassing& passing) {
